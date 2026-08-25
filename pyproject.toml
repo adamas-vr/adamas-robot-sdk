@@ -1,11 +1,14 @@
 [build-system]
-requires = ["setuptools>=70"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "adamas-robot-sdk"
 version = "0.8.0"
 description = "Adamas robot adapter SDK"
+readme = "README.md"
+license = "BSD-2-Clause"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = ["certifi>=2024.7.4", "livekit>=1.0,<2"]
 

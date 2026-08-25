@@ -1,18 +1,20 @@
 import math
 import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 
 IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
+DEFAULT_PLATFORM_URL = "https://robotics.adamasvr.com"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RobotConfig:
-    platform_url: str
     fleet_id: str
     fleet_key: str
     robot_id: str
     name: str
+    platform_url: str = DEFAULT_PLATFORM_URL
     control_timeout_s: float | None = 0.4
 
     def __post_init__(self) -> None:
@@ -22,8 +24,17 @@ class RobotConfig:
         robot_id = self.robot_id.strip()
         name = self.name.strip()
 
-        if not platform_url.startswith(("http://", "https://")):
-            raise ValueError("platform_url must start with http:// or https://")
+        try:
+            parsed_platform_url = urlsplit(platform_url)
+            hostname = parsed_platform_url.hostname
+        except ValueError as error:
+            raise ValueError("platform_url must be a valid HTTPS URL") from error
+        if parsed_platform_url.scheme != "https" or not hostname:
+            raise ValueError("platform_url must be a valid HTTPS URL")
+        if parsed_platform_url.username or parsed_platform_url.password:
+            raise ValueError("platform_url must not contain credentials")
+        if parsed_platform_url.query or parsed_platform_url.fragment:
+            raise ValueError("platform_url must not contain a query or fragment")
         if not IDENTIFIER_PATTERN.fullmatch(fleet_id):
             raise ValueError(
                 "fleet_id may contain letters, numbers, dots, dashes, and underscores"

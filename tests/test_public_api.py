@@ -23,7 +23,6 @@ from adamas_robot_sdk._platform import PlatformError
 
 
 CONFIG = RobotConfig(
-    platform_url="https://fleet.example",
     fleet_id="fleet_01",
     fleet_key="afk_test",
     robot_id="robot_01",

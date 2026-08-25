@@ -53,6 +53,7 @@ class _NetworkSession:
         self._tasks: list[asyncio.Task[None]] = []
         self._last_control_at = 0.0
         self._control_active = False
+        self._last_control_sequences: dict[str, int] = {}
         self._stream_sequences: dict[str, int] = {}
         self.failed_error: Exception | None = None
 
@@ -149,6 +150,13 @@ class _NetworkSession:
                     self._control_active = False
             else:
                 command = ControlFrame.from_message(message)
+                previous_sequence = self._last_control_sequences.get(command.source_id)
+                if (
+                    previous_sequence is not None
+                    and command.sequence <= previous_sequence
+                ):
+                    return
+                self._last_control_sequences[command.source_id] = command.sequence
                 self._last_control_at = time.monotonic()
                 self._control_active = True
         except (KeyError, OverflowError, TypeError, ValueError):

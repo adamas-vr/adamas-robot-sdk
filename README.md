@@ -1,44 +1,106 @@
-# Adamas robot adapter SDK
+# Adamas Robot SDK
 
-The SDK has one integration path: inherit `AdamasRobotAdapter`, implement the
-robot-facing hooks, and call `update()` from the robot system's existing loop.
-The adapter privately manages fleet authentication, retries, LiveKit,
-heartbeats, stream manifests, delivery backpressure, and the control watchdog.
+The Adamas Robot SDK connects an existing robot or simulation to Adamas Cloud
+for teleoperation, fleet supervision, and sensor streaming. Applications
+integrate through one class: inherit `AdamasRobotAdapter`, implement the four
+robot-facing hooks, and call `update()` from the application's existing loop.
 
-The SDK never owns the robot or simulation loop. `update()` performs no waiting
-for network I/O, and all user-defined control and sensor hooks execute on the
-thread that called `update()`. This keeps thread-affine frameworks such as Isaac
-Sim in control of simulation state and lets LeRobot retain ownership of
-`get_observation()` and `send_action()`.
+The SDK owns fleet authentication, retries, LiveKit networking, heartbeats,
+stream manifests, delivery backpressure, and the control watchdog. It does not
+own the robot or simulation loop, and `update()` does not wait for network I/O.
 
-## Install
+## Requirements
 
-Python 3.11 or newer is required.
+- Python 3.11 or newer
+- An Adamas fleet ID and fleet key
+
+## Install from this repository
 
 ```bash
-cd adamas-robot-sdk
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
 
-## Implement an adapter
+## Connect to Adamas Cloud
 
-All connection and robot identity values live in `RobotConfig`; robot-specific
-environment variables are not required.
+`RobotConfig` connects to [Adamas Cloud](https://robotics.adamasvr.com) by
+default. Supply the fleet ID and fleet key from the fleet's **Robot connection**
+card:
+
+```python
+import os
+
+from adamas_robot_sdk import RobotConfig
+
+
+config = RobotConfig(
+    fleet_id=os.environ["ADAMAS_FLEET_ID"],
+    fleet_key=os.environ["ADAMAS_FLEET_KEY"],
+    robot_id="robot-01",
+    name="Robot 01",
+)
+```
+
+Treat the fleet key as a secret and keep it outside source control. The
+`platform_url` option is only needed when Adamas provides a custom endpoint as
+part of an enterprise deployment.
+
+## Try the included dummy adapter
+
+`DummyRobotAdapter` is included in the SDK and produces a generated camera feed
+and robot-state stream. With the two environment variables above set, run this
+script from the repository:
+
+```python
+import os
+import time
+
+from adamas_robot_sdk import DummyRobotAdapter, RobotConfig
+
+
+adapter = DummyRobotAdapter(
+    RobotConfig(
+        fleet_id=os.environ["ADAMAS_FLEET_ID"],
+        fleet_key=os.environ["ADAMAS_FLEET_KEY"],
+        robot_id="sdk-dummy",
+        name="SDK Dummy Robot",
+    )
+)
+
+try:
+    while True:
+        adapter.update()
+        time.sleep(1 / 60)
+finally:
+    adapter.close(timeout=5.0)
+```
+
+The implementation is available in
+[`adamas_robot_sdk/adapters/dummy.py`](adamas_robot_sdk/adapters/dummy.py).
+
+## Implement a robot adapter
+
+The robot-facing contract consists of four hooks:
+
+- `sensors` reports the sensors currently available. Changing this sequence
+  updates the fleet's data-source manifest.
+- `is_robot_connected()` determines whether the robot should appear online.
+- `handle_control()` translates Adamas input into the robot's native commands.
+- `read_sensors()` returns readings for the descriptors requested by the SDK.
 
 ```python
 from collections.abc import Iterable, Sequence
 
 from adamas_robot_sdk import (
     AdamasRobotAdapter,
+    ControlFrame,
     ControlInput,
     ControlSignal,
     RobotConfig,
     SensorDescriptor,
     SensorKind,
     SensorReading,
-    ControlFrame,
 )
 
 
@@ -64,108 +126,85 @@ class MyRobotAdapter(AdamasRobotAdapter):
 
     def handle_control(self, control: ControlInput) -> None:
         if isinstance(control, ControlFrame):
-            self.robot.send_action(translate_control(control))
+            self.robot.apply_control(control)
         elif isinstance(control, ControlSignal):
-            self.robot.handle_signal(control.type)
+            self.robot.apply_signal(control.type)
 
     def read_sensors(
         self, requested: Sequence[SensorDescriptor]
     ) -> Iterable[SensorReading]:
-        observation = self.robot.get_observation()
-        return (SensorReading(self.JOINT_STATE, observation),)
+        if self.JOINT_STATE not in requested:
+            return ()
+        return (
+            SensorReading(
+                self.JOINT_STATE,
+                {"positions": self.robot.joint_positions()},
+            ),
+        )
 ```
 
-The four hooks are the entire robot-facing contract:
-
-- `sensors` reports the sensors currently available at runtime. Changing this
-  sequence updates the fleet's data-source manifest.
-- `is_robot_connected()` prevents disconnected or unavailable robots from being
-  registered in the fleet.
-- `handle_control()` translates Adamas control into the robot system's native
-  action API.
-- `read_sensors()` receives the descriptors due at the current update and
-  returns structured `SensorReading` values.
-
-Sensor descriptors replace publish/subscribe topic strings. The SDK schedules
-each descriptor at its declared `rate_hz`; adapters return readings associated
-with those descriptor objects instead of publishing to arbitrary names.
-Data sensors declare a stable `format`, JSON or binary encoding, and latest or
-reliable delivery. Video sensors become LiveKit media tracks. Stereo cameras
-can declare a shared group and left, right, or side-by-side view.
-
-Incoming `ControlFrame.state` exposes generic `poses`, `axes`, `buttons`, and
-`joints` maps. Its `device_profile_id` identifies the field convention:
-`keyboard-mouse`, `webxr`, `data-glove`, `gamepad`, or a documented
-`custom:...` integration. The robot adapter translates supported fields into
-its native actions. Device profiles catalog possible keys; frames may omit
-every key while the operator is idle.
-
-`ControlFrame` version 2 deliberately describes devices rather than robot
-motion. The built-in keyboard profile emits `pair.ad`, `pair.ws`, `pair.qe`,
-`pair.hk`, `pair.uj`, `pair.yi`, `pair.arrow-up-down`, and
-`pair.arrow-left-right` axes plus `key.z`, `key.x`, `key.c`, and `key.v`
-buttons. Positive values correspond to D, W, E, K, U, I, Up, and Right.
-Adapters decide whether a pair means translation, rotation, locomotion, or
-something else. The keyboard sends Home, R, and Escape through the reliable
-`home`, `reset`, and `stop` signal channel.
-
-The WebXR profile reports `head`, `left.grip`, `left.aim`, `right.grip`, and
-`right.aim` tracking poses alongside controller triggers, squeezes,
-thumbsticks, and buttons. These are raw local-floor device measurements;
-robot adapters own calibration and retargeting.
-
-## Use it in the host loop
+Drive the adapter from the same thread as the robot API:
 
 ```python
-adapter = MyRobotAdapter(
-    RobotConfig(
-        platform_url="https://your-adamas-deployment.example",
-        fleet_id="your-fleet-id",
-        fleet_key="your-fleet-key",
-        robot_id="robot-01",
-        name="Robot 01",
-    ),
-    robot,
-)
+adapter = MyRobotAdapter(config, robot)
 
 try:
-    while robot_system_is_running():
-        robot_system_step()
+    while robot.is_running:
+        robot.step()
         adapter.update()
 finally:
     adapter.close(timeout=5.0)
 ```
 
-The first `update()` starts fleet networking in a background thread and returns
-immediately. Later calls drain control onto the caller's thread and enqueue
-sensor readings without waiting for delivery. `close()` is also non-blocking
-unless a timeout is supplied for graceful shutdown.
+All user-defined hooks run on the thread that calls `update()`. The first call
+starts networking in a background thread. Later calls drain control and enqueue
+sensor readings without blocking the host loop.
 
-HTTPS verification is resolved internally from the Python environment's
-trusted roots and the CA bundle installed with the SDK. TLS trust configuration
-is not part of the robot adapter's public interface.
+## Sensors
 
-Only one active connection may use a robot ID. If another process connects with
-the same ID, its next `update()` raises `RobotConnectionError` with instructions
-to stop the existing process or choose a different ID. Network interruptions
-continue to retry internally.
+Sensor descriptors replace arbitrary topic strings. The SDK schedules each
+descriptor at its declared `rate_hz` and accepts `SensorReading` values tied to
+those descriptor objects.
 
+Data sensors declare a stable `format`, JSON or binary encoding, and latest or
+reliable delivery. Video sensors use `VideoFrame` and become LiveKit media
+tracks. Stereo cameras can declare a shared group and left, right, or
+side-by-side view.
+
+## Control
+
+`ControlFrame.state` exposes generic `poses`, `axes`, `buttons`, and `joints`
+maps. Its `device_profile_id` identifies the field convention:
+`keyboard-mouse`, `webxr`, `data-glove`, `gamepad`, or a documented
+`custom:...` integration. Robot adapters decide how those fields map to native
+motion.
+
+ControlFrame version 2 describes devices rather than robot motion. Duplicate
+and out-of-order frames are ignored per device source for each realtime
+connection. Reliable `stop`, `reset`, and `home` signals are delivered as
+`ControlSignal` values.
+
+## Connection and safety behavior
+
+Only one active connection may use a robot ID. A conflicting process receives a
+`RobotConnectionError`; network interruptions otherwise retry internally.
 `fleet_connected` and `connection_error` are available for health reporting.
-The adapter only appears in the fleet while `is_robot_connected()` returns
-`True`. The default 400 ms watchdog queues a `ControlSignal("stop")`; set
-`control_timeout_s=None` in `RobotConfig` only when the robot framework already
-owns an equivalent safety policy.
 
-## Framework integration
+The default 400 ms watchdog queues `ControlSignal("stop")` when active control
+frames stop arriving. Set `control_timeout_s=None` only when the robot system
+already provides an equivalent or stronger safety policy. Hardware limits and
+an independent emergency-stop mechanism remain the robot integrator's
+responsibility.
 
-For LeRobot, wrap its `Robot` instance in the adapter. Translate
-`ControlFrame` inside `handle_control()` and call `robot.send_action()` there;
-return selected values from `robot.get_observation()` in `read_sensors()`.
+The platform connection always uses HTTPS. Certificate verification uses the
+Python environment's trusted roots plus the CA bundle installed with the SDK.
 
-For Isaac Sim, wrap the articulation or simulation controller. Call
-`adapter.update()` once per application or physics step. Control application and
-sensor reads stay on Isaac Sim's caller thread; only fleet networking runs in
-the background.
+## Tests
 
-The separate `robot-sdk-examples` project contains the included dummy adapter
-and a complete custom adapter implementation.
+```bash
+python -m unittest discover -s tests -v
+```
+
+## License
+
+Licensed under the BSD 2-Clause License. See [`LICENSE`](LICENSE).
