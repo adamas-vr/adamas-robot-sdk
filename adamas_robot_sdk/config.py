@@ -28,9 +28,11 @@ class RobotConfig:
             parsed_platform_url = urlsplit(platform_url)
             hostname = parsed_platform_url.hostname
         except ValueError as error:
-            raise ValueError("platform_url must be a valid HTTPS URL") from error
-        if parsed_platform_url.scheme != "https" or not hostname:
-            raise ValueError("platform_url must be a valid HTTPS URL")
+            raise ValueError(
+                "platform_url must be a valid HTTP or HTTPS URL"
+            ) from error
+        if parsed_platform_url.scheme not in {"http", "https"} or not hostname:
+            raise ValueError("platform_url must be a valid HTTP or HTTPS URL")
         if parsed_platform_url.username or parsed_platform_url.password:
             raise ValueError("platform_url must not contain credentials")
         if parsed_platform_url.query or parsed_platform_url.fragment:

@@ -4,11 +4,12 @@ import ssl
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 import certifi
 
-from .protocol import SensorDescriptor
+from .protocol import _StreamDescriptor
 
 
 class PlatformError(RuntimeError):
@@ -31,11 +32,15 @@ class PlatformClient:
     def __init__(self, api_url: str, identity: RobotIdentity) -> None:
         self.api_url = api_url.rstrip("/")
         self.identity = identity
-        self._ssl_context = _create_ssl_context()
+        self._ssl_context = (
+            _create_ssl_context()
+            if urlsplit(self.api_url).scheme == "https"
+            else None
+        )
 
     async def connect(
         self,
-        sensors: list[SensorDescriptor],
+        streams: list[_StreamDescriptor],
         sdk_version: str,
     ) -> dict[str, Any]:
         return await self._post(
@@ -44,13 +49,13 @@ class PlatformClient:
                 **self._credentials(),
                 "fleetId": self.identity.fleet_id,
                 "name": self.identity.name,
-                "streams": [sensor.to_message() for sensor in sensors],
+                "streams": [stream.to_message() for stream in streams],
                 "sdkVersion": sdk_version,
             },
         )
 
     async def heartbeat(
-        self, sensors: list[SensorDescriptor], status: str = "ready"
+        self, streams: list[_StreamDescriptor], status: str = "ready"
     ) -> None:
         await self._post(
             "/api/robots/heartbeat",
@@ -58,7 +63,7 @@ class PlatformClient:
                 **self._credentials(),
                 "fleetId": self.identity.fleet_id,
                 "status": status,
-                "streams": [sensor.to_message() for sensor in sensors],
+                "streams": [stream.to_message() for stream in streams],
             },
         )
 
@@ -86,11 +91,15 @@ class PlatformClient:
             method="POST",
         )
         try:
-            with urlopen(
-                request,
-                timeout=15,
-                context=self._ssl_context,
-            ) as response:
+            if self._ssl_context is None:
+                response_context = urlopen(request, timeout=15)
+            else:
+                response_context = urlopen(
+                    request,
+                    timeout=15,
+                    context=self._ssl_context,
+                )
+            with response_context as response:
                 return json.loads(response.read())
         except HTTPError as error:
             detail = read_error_detail(error)

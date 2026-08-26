@@ -6,25 +6,24 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import Future
 from typing import Any
 
 from ._platform import PlatformClient, PlatformError, RobotIdentity
 from ._realtime import LiveKitTransport
 from .config import RobotConfig
 from .protocol import (
-    ControlFrame,
     ControlInput,
     ControlSignal,
-    SensorDescriptor,
-    SensorKind,
-    SensorReading,
-    VideoFrame,
+    _StreamDescriptor,
+    _StreamSample,
+    _TelemetrySample,
+    _VideoSample,
+    _WireControlFrame,
 )
 
 
 logger = logging.getLogger(__name__)
-SDK_VERSION = "0.8.0"
+SDK_VERSION = "0.9.0"
 
 
 class _NetworkSession:
@@ -33,7 +32,7 @@ class _NetworkSession:
     def __init__(
         self,
         config: RobotConfig,
-        sensors: tuple[SensorDescriptor, ...],
+        streams: tuple[_StreamDescriptor, ...],
         receive_control: Callable[[ControlInput], None],
     ) -> None:
         identity = RobotIdentity(
@@ -45,7 +44,7 @@ class _NetworkSession:
         )
         self.config = config
         self.identity = identity
-        self.sensors = sensors
+        self.streams = streams
         self.platform = PlatformClient(config.platform_url, identity)
         self.transport = LiveKitTransport()
         self.transport.on_control(self._receive_control)
@@ -58,15 +57,15 @@ class _NetworkSession:
         self.failed_error: Exception | None = None
 
     async def connect(self) -> None:
-        response = await self.platform.connect(list(self.sensors), SDK_VERSION)
+        response = await self.platform.connect(list(self.streams), SDK_VERSION)
         try:
             await self.transport.connect(response["realtime"])
             await self.transport.publish_manifest(
                 self.identity.robot_id,
                 self.identity.connection_id,
-                list(self.sensors),
+                list(self.streams),
             )
-            await self.platform.heartbeat(list(self.sensors))
+            await self.platform.heartbeat(list(self.streams))
         except Exception:
             with contextlib.suppress(Exception):
                 await self.platform.disconnect()
@@ -89,39 +88,31 @@ class _NetworkSession:
         with contextlib.suppress(Exception):
             await self.platform.disconnect()
 
-    async def set_sensors(self, sensors: tuple[SensorDescriptor, ...]) -> None:
-        self.sensors = sensors
-        await self.transport.publish_manifest(
+    async def publish(self, sample: _StreamSample) -> None:
+        if sample.stream not in self.streams:
+            return
+        if isinstance(sample, _VideoSample):
+            await self.transport.publish_video_frame(
+                sample.stream.key, sample.frame
+            )
+            return
+        if not isinstance(sample, _TelemetrySample):
+            raise TypeError("Unsupported stream sample")
+        sequence = self._stream_sequences.get(sample.stream.key, 0) + 1
+        self._stream_sequences[sample.stream.key] = sequence
+        await self.transport.publish_telemetry_sample(
             self.identity.robot_id,
             self.identity.connection_id,
-            list(sensors),
-        )
-        await self.platform.heartbeat(list(sensors))
-
-    async def publish(self, reading: SensorReading) -> None:
-        if reading.sensor not in self.sensors:
-            return
-        if reading.sensor.kind is SensorKind.VIDEO:
-            frame = reading.value
-            if not isinstance(frame, VideoFrame):
-                raise TypeError("Video sensors require VideoFrame values")
-            await self.transport.publish_video_frame(reading.sensor.id, frame)
-            return
-        sequence = self._stream_sequences.get(reading.sensor.id, 0) + 1
-        self._stream_sequences[reading.sensor.id] = sequence
-        await self.transport.publish_stream_sample(
-            self.identity.robot_id,
-            self.identity.connection_id,
-            reading.sensor,
+            sample.stream.key,
             sequence,
-            reading.value,
+            sample.payload_json,
         )
 
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self.HEARTBEAT_SECONDS)
             try:
-                await self.platform.heartbeat(list(self.sensors))
+                await self.platform.heartbeat(list(self.streams))
             except Exception as error:
                 self.failed_error = error
                 return
@@ -149,16 +140,17 @@ class _NetworkSession:
                 if signal_type == "stop":
                     self._control_active = False
             else:
-                command = ControlFrame.from_message(message)
-                previous_sequence = self._last_control_sequences.get(command.source_id)
+                frame = _WireControlFrame.from_message(message)
+                previous_sequence = self._last_control_sequences.get(frame.source_id)
                 if (
                     previous_sequence is not None
-                    and command.sequence <= previous_sequence
+                    and frame.sequence <= previous_sequence
                 ):
                     return
-                self._last_control_sequences[command.source_id] = command.sequence
+                self._last_control_sequences[frame.source_id] = frame.sequence
                 self._last_control_at = time.monotonic()
                 self._control_active = True
+                command = frame.control
         except (KeyError, OverflowError, TypeError, ValueError):
             return
         self._deliver_control(command)
@@ -166,7 +158,6 @@ class _NetworkSession:
 
 class _RobotRuntime:
     COMMAND_QUEUE_SIZE = 256
-    MAX_PENDING_READINGS = 128
 
     def __init__(self, config: RobotConfig) -> None:
         self.config = config
@@ -180,12 +171,12 @@ class _RobotRuntime:
         self._session: _NetworkSession | None = None
         self._close_requested = threading.Event()
         self._robot_connected = False
-        self._sensors: tuple[SensorDescriptor, ...] = ()
+        self._streams: tuple[_StreamDescriptor, ...] = ()
+        self._pending_samples: dict[str, _StreamSample] = {}
         self._state_revision = 0
         self._fleet_connected = False
         self._last_error: Exception | None = None
         self._fatal_error: Exception | None = None
-        self._pending_readings = 0
 
     @property
     def fleet_connected(self) -> bool:
@@ -233,14 +224,16 @@ class _RobotRuntime:
             thread.join(timeout)
 
     def set_robot_state(
-        self, connected: bool, sensors: tuple[SensorDescriptor, ...]
+        self, connected: bool, streams: tuple[_StreamDescriptor, ...]
     ) -> None:
         with self._lock:
             changed = (
-                connected != self._robot_connected or sensors != self._sensors
+                connected != self._robot_connected or streams != self._streams
             )
             self._robot_connected = connected
-            self._sensors = sensors
+            self._streams = streams
+            if not connected:
+                self._pending_samples.clear()
             if changed:
                 self._state_revision += 1
             loop = self._loop
@@ -259,9 +252,19 @@ class _RobotRuntime:
     def clear_controls(self) -> None:
         self.drain_controls()
 
-    def submit_readings(self, readings: tuple[SensorReading, ...]) -> None:
-        for reading in readings:
-            self._submit_reading(reading)
+    def submit_sample(self, sample: _StreamSample) -> None:
+        with self._lock:
+            if (
+                not self._fleet_connected
+                or sample.stream not in self._streams
+                or self._close_requested.is_set()
+            ):
+                return
+            self._pending_samples[sample.stream.key] = sample
+            loop = self._loop
+            wake = self._wake
+        if loop and wake:
+            loop.call_soon_threadsafe(wake.set)
 
     def _thread_main(self) -> None:
         try:
@@ -280,7 +283,7 @@ class _RobotRuntime:
         retry_delay = 1.0
         try:
             while not self._close_requested.is_set():
-                connected, sensors, revision = self._robot_state()
+                connected, streams, revision = self._robot_state()
                 session = self._session
 
                 if not connected:
@@ -291,9 +294,15 @@ class _RobotRuntime:
                     await self._pause(0.5, revision)
                     continue
 
+                if session and streams != session.streams:
+                    await session.close()
+                    self._session = None
+                    self._set_connection(False, None)
+                    continue
+
                 if not session:
                     candidate = _NetworkSession(
-                        self.config, sensors, self._receive_control
+                        self.config, streams, self._receive_control
                     )
                     try:
                         await candidate.connect()
@@ -321,12 +330,16 @@ class _RobotRuntime:
                     retry_delay = min(30.0, retry_delay * 2)
                     continue
 
-                if sensors != session.sensors:
+                samples = self._take_pending_samples()
+                for sample in samples:
                     try:
-                        await session.set_sensors(sensors)
+                        await session.publish(sample)
                     except Exception as error:
-                        session.failed_error = error
-                        continue
+                        logger.warning("Stream delivery failed: %s", error)
+                        with self._lock:
+                            self._last_error = error
+                if samples:
+                    continue
 
                 await self._pause(0.25, revision)
         finally:
@@ -343,42 +356,19 @@ class _RobotRuntime:
         if not wake:
             await asyncio.sleep(timeout)
             return
-        if self._state_changed(revision) or self._close_requested.is_set():
+        if self._should_wake(revision):
             return
         wake.clear()
-        if self._state_changed(revision) or self._close_requested.is_set():
+        if self._should_wake(revision):
             return
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(wake.wait(), timeout)
 
-    async def _publish(self, reading: SensorReading) -> None:
-        session = self._session
-        if session and self.fleet_connected:
-            await session.publish(reading)
-
-    def _submit_reading(self, reading: SensorReading) -> bool:
+    def _take_pending_samples(self) -> tuple[_StreamSample, ...]:
         with self._lock:
-            loop = self._loop
-            if (
-                not loop
-                or not self._fleet_connected
-                or self._pending_readings >= self.MAX_PENDING_READINGS
-            ):
-                return False
-            self._pending_readings += 1
-        future = asyncio.run_coroutine_threadsafe(self._publish(reading), loop)
-        future.add_done_callback(self._reading_finished)
-        return True
-
-    def _reading_finished(self, future: Future[None]) -> None:
-        with self._lock:
-            self._pending_readings -= 1
-        try:
-            future.result()
-        except Exception as error:
-            logger.warning("Sensor delivery failed: %s", error)
-            with self._lock:
-                self._last_error = error
+            samples = tuple(self._pending_samples.values())
+            self._pending_samples.clear()
+            return samples
 
     def _receive_control(self, command: ControlInput) -> None:
         if self._controls.full():
@@ -388,13 +378,17 @@ class _RobotRuntime:
 
     def _robot_state(
         self,
-    ) -> tuple[bool, tuple[SensorDescriptor, ...], int]:
+    ) -> tuple[bool, tuple[_StreamDescriptor, ...], int]:
         with self._lock:
-            return self._robot_connected, self._sensors, self._state_revision
+            return self._robot_connected, self._streams, self._state_revision
 
-    def _state_changed(self, revision: int) -> bool:
+    def _should_wake(self, revision: int) -> bool:
         with self._lock:
-            return revision != self._state_revision
+            return (
+                revision != self._state_revision
+                or bool(self._pending_samples)
+                or self._close_requested.is_set()
+            )
 
     def _set_connection(
         self, connected: bool, error: Exception | None
@@ -402,9 +396,12 @@ class _RobotRuntime:
         with self._lock:
             self._fleet_connected = connected
             self._last_error = error
+            if not connected:
+                self._pending_samples.clear()
 
     def _set_fatal_error(self, error: Exception) -> None:
         with self._lock:
             self._fleet_connected = False
+            self._pending_samples.clear()
             self._last_error = error
             self._fatal_error = error

@@ -1,3 +1,4 @@
+import json
 import math
 import re
 from dataclasses import dataclass, field
@@ -5,102 +6,36 @@ from enum import StrEnum
 from typing import Any, Literal
 
 
-SENSOR_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
-FORMAT_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/+:-]{0,79}$")
+STREAM_KEY_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 CUSTOM_DEVICE_PROFILE_PATTERN = re.compile(
     r"^custom:[a-z0-9][a-z0-9._-]{0,55}$"
 )
 FIELD_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+MAX_TELEMETRY_JSON_BYTES = 900
+MAX_VIDEO_PIXELS = 3_840 * 2_160
 ControlSignalType = Literal["stop", "reset", "home"]
 DeviceProfileId = str
 
 
-class SensorKind(StrEnum):
+class _StreamKind(StrEnum):
+    TELEMETRY = "telemetry"
     VIDEO = "video"
-    DATA = "data"
-
-
-class SensorEncoding(StrEnum):
-    JSON = "json"
-    BINARY = "binary"
-
-
-class SensorDelivery(StrEnum):
-    LATEST = "latest"
-    RELIABLE = "reliable"
-
-
-class StereoView(StrEnum):
-    LEFT = "left"
-    RIGHT = "right"
-    SIDE_BY_SIDE = "side-by-side"
 
 
 @dataclass(frozen=True, slots=True)
-class StereoVideo:
-    group_id: str
-    view: StereoView
+class _StreamDescriptor:
+    key: str
+    kind: _StreamKind
 
     def __post_init__(self) -> None:
-        if not SENSOR_ID_PATTERN.fullmatch(self.group_id):
-            raise ValueError("Stereo group IDs must use a valid sensor ID")
-        object.__setattr__(self, "view", StereoView(self.view))
-
-
-@dataclass(frozen=True, slots=True)
-class SensorDescriptor:
-    id: str
-    name: str
-    kind: SensorKind
-    rate_hz: float = 10.0
-    format: str = "adamas.json.v1"
-    encoding: SensorEncoding = SensorEncoding.JSON
-    delivery: SensorDelivery = SensorDelivery.LATEST
-    stereo: StereoVideo | None = None
-
-    def __post_init__(self) -> None:
-        name = self.name.strip()
-        kind = SensorKind(self.kind)
-        encoding = SensorEncoding(self.encoding)
-        delivery = SensorDelivery(self.delivery)
-        if not SENSOR_ID_PATTERN.fullmatch(self.id):
+        if not STREAM_KEY_PATTERN.fullmatch(self.key):
             raise ValueError(
-                "Sensor IDs may contain letters, numbers, dots, dashes, and underscores"
+                "Stream keys may contain letters, numbers, dots, dashes, and underscores"
             )
-        if not name or len(name) > 80:
-            raise ValueError("Sensor names must contain between 1 and 80 characters")
-        if not math.isfinite(self.rate_hz) or not 0 < self.rate_hz <= 120:
-            raise ValueError("Sensor rate_hz must be between 0 and 120")
-        if kind is SensorKind.DATA and not FORMAT_PATTERN.fullmatch(self.format):
-            raise ValueError("Data sensor format must be a valid format identifier")
-        if kind is SensorKind.VIDEO and self.stereo is not None:
-            StereoVideo(self.stereo.group_id, self.stereo.view)
-        if kind is SensorKind.DATA and self.stereo is not None:
-            raise ValueError("Stereo metadata can only be used with video sensors")
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "kind", kind)
-        object.__setattr__(self, "encoding", encoding)
-        object.__setattr__(self, "delivery", delivery)
+        object.__setattr__(self, "kind", _StreamKind(self.kind))
 
-    def to_message(self) -> dict[str, Any]:
-        message: dict[str, Any] = {
-            "id": self.id,
-            "label": self.name,
-            "kind": self.kind.value,
-            "rateHz": self.rate_hz,
-        }
-        if self.kind is SensorKind.DATA:
-            message.update(
-                format=self.format,
-                encoding=self.encoding.value,
-                delivery=self.delivery.value,
-            )
-        elif self.stereo:
-            message["stereo"] = {
-                "groupId": self.stereo.group_id,
-                "view": self.stereo.view.value,
-            }
-        return message
+    def to_message(self) -> dict[str, str]:
+        return {"key": self.key, "kind": self.kind.value}
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,29 +47,41 @@ class VideoFrame:
     def __post_init__(self) -> None:
         if self.width <= 0 or self.height <= 0:
             raise ValueError("Video frame dimensions must be positive")
+        if self.width * self.height > MAX_VIDEO_PIXELS:
+            raise ValueError(
+                f"Video frames cannot exceed {MAX_VIDEO_PIXELS} pixels"
+            )
         if len(self.rgba) != self.width * self.height * 4:
             raise ValueError("VideoFrame requires four RGBA bytes per pixel")
 
 
-SensorValue = Any | VideoFrame
+@dataclass(frozen=True, slots=True)
+class _TelemetrySample:
+    stream: _StreamDescriptor
+    payload_json: bytes
 
 
 @dataclass(frozen=True, slots=True)
-class SensorReading:
-    sensor: SensorDescriptor
-    value: SensorValue
+class _VideoSample:
+    stream: _StreamDescriptor
+    frame: VideoFrame
 
-    def __post_init__(self) -> None:
-        if self.sensor.kind is SensorKind.VIDEO:
-            if not isinstance(self.value, VideoFrame):
-                raise TypeError("Video sensors require a VideoFrame value")
-            return
-        if isinstance(self.value, VideoFrame):
-            raise TypeError("VideoFrame values require a video sensor")
-        if self.sensor.encoding is SensorEncoding.BINARY and not isinstance(
-            self.value, bytes
-        ):
-            raise TypeError("Binary data sensors require a bytes value")
+
+_StreamSample = _TelemetrySample | _VideoSample
+
+
+def encode_telemetry(value: Any) -> bytes:
+    try:
+        payload = json.dumps(
+            value, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise TypeError("Telemetry values must be valid JSON") from error
+    if len(payload) > MAX_TELEMETRY_JSON_BYTES:
+        raise ValueError(
+            f"Telemetry JSON cannot exceed {MAX_TELEMETRY_JSON_BYTES} bytes"
+        )
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,17 +100,22 @@ class ControlState:
 
 @dataclass(frozen=True, slots=True)
 class ControlFrame:
+    device_profile_id: DeviceProfileId
+    state: ControlState
+
+
+@dataclass(frozen=True, slots=True)
+class _WireControlFrame:
     sequence: int
     captured_at_us: int
     source_id: str
-    device_profile_id: DeviceProfileId
-    state: ControlState
+    control: ControlFrame
     version: Literal[2] = 2
 
     @classmethod
-    def from_message(cls, message: dict[str, Any]) -> "ControlFrame":
+    def from_message(cls, message: dict[str, Any]) -> "_WireControlFrame":
         if not isinstance(message, dict) or message.get("version") != 2:
-            raise ValueError("ControlFrame version must be 2")
+            raise ValueError("Control frame version must be 2")
         source_id = message.get("sourceId")
         if not isinstance(source_id, str) or not 1 <= len(source_id) <= 128:
             raise ValueError("sourceId must contain 1 to 128 characters")
@@ -174,15 +126,16 @@ class ControlFrame:
             raise ValueError(
                 "deviceProfileId is not a recognized or valid custom device profile"
             )
-        state = parse_control_state(message.get("state"))
         return cls(
             sequence=nonnegative_int(message.get("sequence"), "sequence"),
             captured_at_us=nonnegative_int(
                 message.get("capturedAtUs"), "capturedAtUs"
             ),
             source_id=source_id,
-            device_profile_id=device_profile_id,
-            state=state,
+            control=ControlFrame(
+                device_profile_id=device_profile_id,
+                state=parse_control_state(message.get("state")),
+            ),
         )
 
 
@@ -252,7 +205,7 @@ def parse_pose(value: Any, name: str) -> Pose:
 
 
 def is_valid_device_profile_id(value: str) -> bool:
-    return value in {"keyboard-mouse", "webxr", "data-glove", "gamepad"} or bool(
+    return value in {"keyboard-mouse", "webxr", "gamepad"} or bool(
         CUSTOM_DEVICE_PROFILE_PATTERN.fullmatch(value)
     )
 
@@ -279,8 +232,7 @@ def require_dict(value: Any, name: str) -> dict[str, Any]:
 def vector(value: Any, length: int, name: str) -> tuple[float, ...]:
     if not isinstance(value, (list, tuple)) or len(value) != length:
         raise ValueError(f"{name} must contain {length} numbers")
-    result = tuple(finite_float(component, name) for component in value)
-    return result
+    return tuple(finite_float(component, name) for component in value)
 
 
 def finite_float(value: Any, name: str) -> float:

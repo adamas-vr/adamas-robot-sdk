@@ -1,20 +1,17 @@
 # Adamas Robot SDK
 
 The Adamas Robot SDK connects an existing robot or simulation to Adamas Cloud
-for teleoperation, fleet supervision, and sensor streaming. Applications
-integrate through one class: inherit `AdamasRobotAdapter`, implement the four
-robot-facing hooks, and call `update()` from the application's existing loop.
-
-The SDK owns fleet authentication, retries, LiveKit networking, heartbeats,
-stream manifests, delivery backpressure, and the control watchdog. It does not
-own the robot or simulation loop, and `update()` does not wait for network I/O.
+for teleoperation, fleet supervision, JSON telemetry, and mono video. Integrate
+one `AdamasRobotAdapter` into the application's existing loop; the SDK keeps
+authentication, retries, LiveKit networking, heartbeats, latest-value
+backpressure, and the control watchdog on a background thread.
 
 ## Requirements
 
 - Python 3.11 or newer
 - An Adamas fleet ID and fleet key
 
-## Install from this repository
+## Install
 
 ```bash
 python -m venv .venv
@@ -22,10 +19,10 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-## Connect to Adamas Cloud
+## Configure a robot
 
 `RobotConfig` connects to [Adamas Cloud](https://robotics.adamasvr.com) by
-default. Supply the fleet ID and fleet key from the fleet's **Robot connection**
+default. Copy the fleet ID and fleet key from the fleet's **Robot connection**
 card:
 
 ```python
@@ -42,84 +39,34 @@ config = RobotConfig(
 )
 ```
 
-Treat the fleet key as a secret and keep it outside source control. The
-`platform_url` option is only needed when Adamas provides a custom endpoint as
-part of an enterprise deployment.
+Keep the fleet key outside source control. `platform_url` accepts explicit
+`https://` and `http://` URLs. Production and remote endpoints should use
+HTTPS. Plain HTTP is intended for a trusted local development server, for
+example `platform_url="http://localhost:3000"`, because it transmits the fleet
+key without TLS protection.
 
-## Try the included dummy adapter
+## Implement an adapter
 
-`DummyRobotAdapter` is included in the SDK and produces a generated camera feed
-and robot-state stream. With the two environment variables above set, run this
-script from the repository:
-
-```python
-import os
-import time
-
-from adamas_robot_sdk import DummyRobotAdapter, RobotConfig
-
-
-adapter = DummyRobotAdapter(
-    RobotConfig(
-        fleet_id=os.environ["ADAMAS_FLEET_ID"],
-        fleet_key=os.environ["ADAMAS_FLEET_KEY"],
-        robot_id="sdk-dummy",
-        name="SDK Dummy Robot",
-    )
-)
-
-try:
-    while True:
-        adapter.update()
-        time.sleep(1 / 60)
-finally:
-    adapter.close(timeout=5.0)
-```
-
-The implementation is available in
-[`adamas_robot_sdk/adapters/dummy.py`](adamas_robot_sdk/adapters/dummy.py).
-
-## Implement a robot adapter
-
-The robot-facing contract consists of four hooks:
-
-- `sensors` reports the sensors currently available. Changing this sequence
-  updates the fleet's data-source manifest.
-- `is_robot_connected()` determines whether the robot should appear online.
-- `handle_control()` translates Adamas input into the robot's native commands.
-- `read_sensors()` returns readings for the descriptors requested by the SDK.
+Register every stream in `__init__`, before the first `update()`. The returned
+handle is the publication API:
 
 ```python
-from collections.abc import Iterable, Sequence
-
 from adamas_robot_sdk import (
     AdamasRobotAdapter,
     ControlFrame,
     ControlInput,
     ControlSignal,
     RobotConfig,
-    SensorDescriptor,
-    SensorKind,
-    SensorReading,
+    VideoFrame,
 )
 
 
 class MyRobotAdapter(AdamasRobotAdapter):
-    JOINT_STATE = SensorDescriptor(
-        id="joint-state",
-        name="Joint state",
-        kind=SensorKind.DATA,
-        rate_hz=30,
-        format="adamas.joint-state.v1",
-    )
-
     def __init__(self, config: RobotConfig, robot) -> None:
         super().__init__(config)
         self.robot = robot
-
-    @property
-    def sensors(self) -> Sequence[SensorDescriptor]:
-        return (self.JOINT_STATE,)
+        self.state = self.add_telemetry("robot_state")
+        self.camera = self.add_video("front_camera")
 
     def is_robot_connected(self) -> bool:
         return self.robot.is_connected
@@ -130,20 +77,13 @@ class MyRobotAdapter(AdamasRobotAdapter):
         elif isinstance(control, ControlSignal):
             self.robot.apply_signal(control.type)
 
-    def read_sensors(
-        self, requested: Sequence[SensorDescriptor]
-    ) -> Iterable[SensorReading]:
-        if self.JOINT_STATE not in requested:
-            return ()
-        return (
-            SensorReading(
-                self.JOINT_STATE,
-                {"positions": self.robot.joint_positions()},
-            ),
-        )
+    def publish_outputs(self) -> None:
+        self.state.publish({"positions": self.robot.joint_positions()})
+        width, height, rgba = self.robot.camera_rgba()
+        self.camera.publish(VideoFrame(width, height, rgba))
 ```
 
-Drive the adapter from the same thread as the robot API:
+Drive it from the thread that owns the robot API:
 
 ```python
 adapter = MyRobotAdapter(config, robot)
@@ -152,54 +92,64 @@ try:
     while robot.is_running:
         robot.step()
         adapter.update()
+        adapter.publish_outputs()
 finally:
     adapter.close(timeout=5.0)
 ```
 
-All user-defined hooks run on the thread that calls `update()`. The first call
-starts networking in a background thread. Later calls drain control and enqueue
-sensor readings without blocking the host loop.
+`update()` is non-blocking. It starts networking on the first call and delivers
+received controls on the calling thread.
 
-## Sensors
+## Streams
 
-Sensor descriptors replace arbitrary topic strings. The SDK schedules each
-descriptor at its declared `rate_hz` and accepts `SensorReading` values tied to
-those descriptor objects.
+- `add_telemetry(key)` registers JSON telemetry. `publish(value)` validates and
+  serializes the value immediately.
+- `add_video(key)` registers mono RGBA video. `publish(VideoFrame(...))` accepts
+  the current frame dimensions, so resolution may change while a track is live.
+- The key is the stream's stable identity and the exact text displayed in the
+  portal. Keys must be unique and contain at most 64 letters, numbers, dots,
+  dashes, or underscores.
+- Registration closes on the first `update()`. Create a new adapter connection
+  to change the stream manifest.
+- Publication cadence belongs to the host loop. The SDK makes no frequency or
+  reliable-delivery promise. It keeps only the latest pending value for each
+  stream and drops publications while disconnected.
 
-Data sensors declare a stable `format`, JSON or binary encoding, and latest or
-reliable delivery. Video sensors use `VideoFrame` and become LiveKit media
-tracks. Stereo cameras can declare a shared group and left, right, or
-side-by-side view.
+Telemetry is JSON-only and limited to 900 encoded bytes. Video is mono-only and
+limited to 8,294,400 pixels per frame. Binary telemetry, format names, labels,
+delivery modes, declared rates, and stereo metadata are intentionally outside
+the MVP API.
 
 ## Control
 
-`ControlFrame.state` exposes generic `poses`, `axes`, `buttons`, and `joints`
-maps. Its `device_profile_id` identifies the field convention:
-`keyboard-mouse`, `webxr`, `data-glove`, `gamepad`, or a documented
-`custom:...` integration. Robot adapters decide how those fields map to native
-motion.
+`ControlFrame` contains only `device_profile_id` and a generic `ControlState`:
+`poses`, `axes`, `buttons`, and `joints`. Adamas supplies fixed key catalogs for
+`keyboard-mouse`, `webxr`, and `gamepad`; integrations may define stable
+`custom:...` device profiles. Robot adapters map those generic device fields to
+native motion.
 
-ControlFrame version 2 describes devices rather than robot motion. Duplicate
-and out-of-order frames are ignored per device source for each realtime
-connection. Reliable `stop`, `reset`, and `home` signals are delivered as
+Wire versioning, timestamps, source IDs, and sequence numbers are handled
+inside the SDK. Duplicate and out-of-order frames never reach
+`handle_control()`. Reliable `stop`, `reset`, and `home` commands arrive as
 `ControlSignal` values.
 
-## Connection and safety behavior
+## Connection and safety
 
 Only one active connection may use a robot ID. A conflicting process receives a
-`RobotConnectionError`; network interruptions otherwise retry internally.
+`RobotConnectionError`; ordinary network interruptions retry internally.
 `fleet_connected` and `connection_error` are available for health reporting.
+The SDK re-announces the current stream manifest when an operator joins, so an
+active video or telemetry stream remains discoverable after a portal refresh.
 
-The default 400 ms watchdog queues `ControlSignal("stop")` when active control
+The default 400 ms watchdog delivers `ControlSignal("stop")` when active control
 frames stop arriving. Set `control_timeout_s=None` only when the robot system
-already provides an equivalent or stronger safety policy. Hardware limits and
-an independent emergency-stop mechanism remain the robot integrator's
-responsibility.
+already has an equivalent or stronger policy. Hardware limits and an
+independent emergency stop remain the integrator's responsibility.
 
-The platform connection always uses HTTPS. Certificate verification uses the
-Python environment's trusted roots plus the CA bundle installed with the SDK.
+## Dummy adapter and tests
 
-## Tests
+`DummyRobotAdapter` publishes generated `front_camera` video and `robot_state`
+telemetry using the same API.
 
 ```bash
 python -m unittest discover -s tests -v

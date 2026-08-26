@@ -25,13 +25,19 @@ class RobotConfigTests(unittest.TestCase):
 
         self.assertEqual(config.platform_url, "https://fleet.example:8443/platform")
 
-    def test_rejects_plain_http_platform_url(self) -> None:
-        with self.assertRaisesRegex(ValueError, "valid HTTPS URL"):
-            RobotConfig(platform_url="http://fleet.example", **VALID_CONFIG)
+    def test_accepts_http_platform_url(self) -> None:
+        config = RobotConfig(
+            platform_url="http://localhost:3000/",
+            **VALID_CONFIG,
+        )
+
+        self.assertEqual(config.platform_url, "http://localhost:3000")
 
     def test_rejects_invalid_or_credentialed_platform_url(self) -> None:
         invalid_urls = (
             "https://",
+            "localhost:3000",
+            "ftp://fleet.example",
             "https://user:password@fleet.example",
             "https://fleet.example?token=value",
             "https://fleet.example#fragment",

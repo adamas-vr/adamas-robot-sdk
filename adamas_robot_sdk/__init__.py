@@ -9,15 +9,9 @@ from .protocol import (
     ControlSignal,
     ControlState,
     Pose,
-    SensorDelivery,
-    SensorDescriptor,
-    SensorEncoding,
-    SensorKind,
-    SensorReading,
-    StereoVideo,
-    StereoView,
     VideoFrame,
 )
+from .streams import TelemetryPublisher, VideoPublisher
 
 __all__ = [
     "AdamasRobotAdapter",
@@ -29,12 +23,7 @@ __all__ = [
     "Pose",
     "RobotConfig",
     "RobotConnectionError",
-    "SensorDelivery",
-    "SensorDescriptor",
-    "SensorEncoding",
-    "SensorKind",
-    "SensorReading",
-    "StereoVideo",
-    "StereoView",
+    "TelemetryPublisher",
     "VideoFrame",
+    "VideoPublisher",
 ]

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adamas-robot-sdk"
-version = "0.8.0"
-description = "Adamas robot adapter SDK"
+version = "0.9.0"
+description = "Adamas teleoperation SDK for robot control, JSON telemetry, and video"
 readme = "README.md"
 license = "BSD-2-Clause"
 license-files = ["LICENSE"]
