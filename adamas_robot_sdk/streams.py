@@ -31,7 +31,7 @@ class TelemetryPublisher:
 
 
 class VideoPublisher:
-    """Non-blocking publisher for one mono RGBA video stream."""
+    """Non-blocking publisher for one video stream."""
 
     def __init__(
         self,

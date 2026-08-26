@@ -9,7 +9,7 @@ description = "Adamas teleoperation SDK for robot control, JSON telemetry, and v
 readme = "README.md"
 license = "BSD-2-Clause"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = ["certifi>=2024.7.4", "livekit>=1.0,<2"]
 
 [tool.setuptools.packages.find]

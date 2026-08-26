@@ -40,7 +40,7 @@ class AdamasRobotAdapter(ABC):
         return TelemetryPublisher(stream, self._runtime.submit_sample)
 
     def add_video(self, key: str) -> VideoPublisher:
-        """Register one mono RGBA video stream before the first update."""
+        """Register one video stream before the first update."""
         stream = self._register_stream(key, _StreamKind.VIDEO)
         return VideoPublisher(stream, self._runtime.submit_sample)
 

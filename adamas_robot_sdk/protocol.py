@@ -2,7 +2,7 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 from typing import Any, Literal
 
 
@@ -17,7 +17,7 @@ ControlSignalType = Literal["stop", "reset", "home"]
 DeviceProfileId = str
 
 
-class _StreamKind(StrEnum):
+class _StreamKind(str, Enum):
     TELEMETRY = "telemetry"
     VIDEO = "video"
 
