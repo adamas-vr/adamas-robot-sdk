@@ -47,7 +47,8 @@ config = RobotConfig(
 Keep the fleet key outside source control. Included and subscription robot
 connection plans use the Adamas-hosted operations service, so `platform_url`
 should remain at its default value. Every account includes three concurrent
-robot connections, with subscriptions available for additional capacity.
+robot connections shared across all fleets owned by that account, with
+subscriptions available for additional capacity.
 Dedicated deployments under a custom domain are offered only through custom
 enterprise engagements. Customers provisioned with one should set
 `platform_url` to the HTTPS endpoint supplied by Adamas.
@@ -153,7 +154,8 @@ inside the SDK. Duplicate and out-of-order frames never reach
 
 ## Connection and safety
 
-Only one active connection may use a robot ID. A conflicting process receives a
+Only one active connection may use a robot ID. A conflicting process or an
+account that has reached its concurrent connection limit receives a
 `RobotConnectionError`; ordinary network interruptions retry internally.
 `fleet_connected` and `connection_error` are available for health reporting.
 The SDK re-announces the current stream manifest when an operator joins, so an

@@ -154,6 +154,28 @@ class PublicApiTests(unittest.TestCase):
 
         self.assertEqual(ConflictSession.attempts, 1)
 
+    def test_account_connection_limit_raises_human_readable_error(self) -> None:
+        QuotaSession.started.clear()
+        QuotaSession.attempts = 0
+        with patch("adamas_robot_sdk._runtime._NetworkSession", QuotaSession):
+            adapter = RecordingAdapter(CONFIG)
+            try:
+                adapter.update()
+                self.assertTrue(QuotaSession.started.wait(1.0))
+                deadline = time.monotonic() + 1.0
+                while adapter.connection_error is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+
+                with self.assertRaisesRegex(
+                    RobotConnectionError,
+                    "reached its concurrent robot connection limit of 3",
+                ):
+                    adapter.update()
+            finally:
+                adapter.close(timeout=1.0)
+
+        self.assertEqual(QuotaSession.attempts, 1)
+
     def test_included_dummy_publishes_telemetry_and_video(self) -> None:
         with patch("adamas_robot_sdk.adapter._RobotRuntime", FakeRuntime):
             adapter = DummyRobotAdapter(CONFIG)
@@ -239,6 +261,19 @@ class ConflictSession(SlowSession):
             409,
             'Robot ID "robot_01" is already connected. '
             "Stop the existing robot process or choose a different robot ID.",
+        )
+
+
+class QuotaSession(SlowSession):
+    attempts = 0
+
+    async def connect(self) -> None:
+        type(self).attempts += 1
+        self.started.set()
+        raise PlatformError(
+            402,
+            "This account has reached its concurrent robot connection limit of 3. "
+            "Disconnect another robot or change the account's robot connection plan.",
         )
 
 

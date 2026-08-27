@@ -23,7 +23,7 @@ from .protocol import (
 
 
 logger = logging.getLogger(__name__)
-SDK_VERSION = "0.9.0"
+SDK_VERSION = "0.9.1"
 
 
 class _NetworkSession:
@@ -309,7 +309,10 @@ class _RobotRuntime:
                     except Exception as error:
                         with contextlib.suppress(Exception):
                             await candidate.close()
-                        if isinstance(error, PlatformError) and error.status == 409:
+                        if (
+                            isinstance(error, PlatformError)
+                            and error.status in {402, 409}
+                        ):
                             self._set_fatal_error(error)
                             return
                         self._set_connection(False, error)
